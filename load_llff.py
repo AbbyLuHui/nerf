@@ -106,10 +106,14 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         return poses, bds
     
     def imread(f):
+        pic = 0
         if f.endswith('png'):
-            return imageio.imread(f, ignoregamma=True)
+            pic = imageio.imread(f, ignoregamma=True)
         else:
-            return imageio.imread(f)
+            pic = imageio.imread(f)
+        #pic = np.dot(pic[... , :3],[0.114, 0.587, 0.299])
+        #pic = pic.reshape(pic.shape[0], pic.shape[1], 1)
+        return pic
         
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  

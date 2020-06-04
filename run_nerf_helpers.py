@@ -137,6 +137,10 @@ def get_rays_np(H, W, focal, c2w):
     dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i)], -1)
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+    #rays_d = np.dot(rays_d[... , :3],[0.114, 0.587, 0.299])
+    #rays_o = np.dot(rays_o[... , :3],[0.114, 0.587, 0.299])
+    #rays_d = rays_d.reshape(rays_d.shape[0], rays_d.shape[1],1)
+    #rays_o = rays_o.reshape(rays_o.shape[0], rays_o.shape[1],1)
     return rays_o, rays_d
 
 
