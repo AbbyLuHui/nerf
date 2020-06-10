@@ -16,6 +16,11 @@ def mse2psnr(x): return -10.*tf.log(x)/tf.log(10.)
 
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
 
+def unison_shuffle(a, b):
+    assert len(a) == len(b)
+    p = np.random.permutation(len(a))
+    return a[p], b[p]
+
 
 # Positional encoding
 
@@ -77,7 +82,7 @@ def get_embedder(multires, i=0):
 
 # Model architecture
 
-def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+def init_nerf_model(reference_frame=None, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
 
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
@@ -98,17 +103,29 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         outputs = dense(W)(outputs)
         if i in skips:
             outputs = tf.concat([inputs_pts, outputs], -1)
-
+    
     if use_viewdirs:
         alpha_out = dense(1, act=None)(outputs)
         bottleneck = dense(256, act=None)(outputs)
+        #compute similarity matrix between target frame and reference frame
+
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
         outputs = inputs_viewdirs
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
-        for i in range(1):
-            outputs = dense(W//2)(outputs)
+
+        # if this is the reference frame, return the 256 dimensional feature vector concat with view directions
+        #if reference_frame=='True':
+        #    print("output")
+        #    return outputs
+        # if a reference frame is provided, compute similarity matrix
+        #else:
+
+        
+        #for i in range(1):
+        #    outputs = dense(W//2)(outputs)
+        
         outputs = dense(3, act=None)(outputs)
         outputs = tf.concat([outputs, alpha_out], -1)
     else:

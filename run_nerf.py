@@ -89,6 +89,7 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
+    #print('----------------------------------', network_fn.get_layer('tf_op_layer_concat_4').output[... , :3])
 
     def raw2outputs(raw, z_vals, rays_d):
         """Transforms model's predictions to semantically meaningful values.
@@ -201,6 +202,9 @@ def render_rays(ray_batch,
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    print("-------------------------------", rays_o[..., None, :].shape)
+    print("-------------------------------", rays_d[..., None, :].shape)
+    print("-------------------------------", z_vals[..., :, None].shape)
 
     # Evaluate model at each point.
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
@@ -387,10 +391,16 @@ def create_nerf(args):
             args.multires_views, args.i_embed)
     output_ch = 4
     skips = [4]
+    reference_model = init_nerf_model(
+        reference_frame='True',
+        D=args.netdepth, W=args.netwidth,
+        input_ch=input_ch, output_ch=output_ch, skips=skips,
+        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
     model = init_nerf_model(
         D=args.netdepth, W=args.netwidth,
         input_ch=input_ch, output_ch=output_ch, skips=skips,
         input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+    
     grad_vars = model.trainable_variables
     models = {'model': model}
 
@@ -445,6 +455,7 @@ def create_nerf(args):
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
         print('Reloading from', ft_weights)
+        a = np.load(ft_weights, allow_pickle=True)
         model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         print('Resetting step to', start)
@@ -455,7 +466,7 @@ def create_nerf(args):
             print('Reloading fine from', ft_weights_fine)
             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, models
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference_model
 
 
 def config_parser():
@@ -491,7 +502,7 @@ def config_parser():
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true',
                         help='only take random rays from 1 image at a time')
-    parser.add_argument("--no_reload", action='store_true',
+    parser.add_argument("--no_reload", action='store_false',
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None,
                         help='specific weights npy file to reload for coarse network')
@@ -566,7 +577,7 @@ def config_parser():
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=9601,
+    parser.add_argument("--i_video",   type=int, default=5000,
                         help='frequency of render_poses video saving')
 
     return parser
@@ -585,7 +596,7 @@ def train():
     # Load data
 
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+        images, targets, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
         hwf = poses[0, :3, -1]
@@ -668,7 +679,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
+    render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference = create_nerf(
         args)
 
     bds_dict = {
@@ -731,20 +742,27 @@ def train():
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+        targets_rgb = np.concatenate([rays, targets[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+        targets_rgb = np.transpose(targets_rgb, [0, 2, 3, 1, 4])
         rays_rgb = np.stack([rays_rgb[i]
                              for i in i_train], axis=0)  # train images only
+        targets_rgb = np.stack([targets_rgb[i] for i in i_train], axis=0)
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+        targets_rgb = np.reshape(targets_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
+        targets_rgb = targets_rgb.astype(np.float32)
         print('shuffle rays')
-        np.random.shuffle(rays_rgb)
+        rays_rgb, targets_rgb = unison_shuffle(rays_rgb, targets_rgb)
+        #np.random.shuffle(rays_rgb)
+        #np.random.shuffle(targets_rgb)
         print('done')
         i_batch = 0
 
     #N_iters = 1000000
-    N_iters=10000
+    N_iters=5010
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -758,6 +776,7 @@ def train():
     for i in range(start, N_iters):
         time0 = time.time()
 
+
         # Sample random ray batch
 
         if use_batching:
@@ -765,19 +784,24 @@ def train():
             batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
             batch = tf.transpose(batch, [1, 0, 2])
 
+            target_batch = targets_rgb[i_batch:i_batch+N_rand]
+            target_batch = tf.transpose(target_batch, [1, 0, 2])
+
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
             batch_rays, target_s = batch[:2], batch[2]
+            target_s_rgb = target_batch[2]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
-                np.random.shuffle(rays_rgb)
+                rays_rgb, targets_rgb = unison_shuffle(rays_rgb, targets_rgb)
                 i_batch = 0
 
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
+            target_rgb = targets[img_i]
             pose = poses[img_i, :3, :4]
 
             if N_rand is not None:
@@ -802,6 +826,7 @@ def train():
                 rays_d = tf.gather_nd(rays_d, select_inds)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
+                target_s_rgb = tf.gather_nd(target_rgb, select_inds)
 
         #####  Core optimization loop  #####
 

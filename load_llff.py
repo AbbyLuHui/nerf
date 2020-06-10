@@ -89,13 +89,23 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         factor = 1
     
     imgdir = os.path.join(basedir, 'images' + sfx)
+    targetdir = os.path.join(basedir, 'images' + sfx + '_rgb')
     if not os.path.exists(imgdir):
         print( imgdir, 'does not exist, returning' )
         return
+
+    if not os.path.exists(targetdir):
+        print( targetdir, 'does not exist, returning' )
+        return
     
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    targetfiles = [os.path.join(targetdir, f) for f in sorted(os.listdir(targetdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
+        return
+
+    if poses.shape[-1] != len(targetfiles):
+        print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(targetfiles), poses.shape[-1]) )
         return
     
     sh = imageio.imread(imgfiles[0]).shape
@@ -111,15 +121,17 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             pic = imageio.imread(f, ignoregamma=True)
         else:
             pic = imageio.imread(f)
-        #pic = np.dot(pic[... , :3],[0.114, 0.587, 0.299])
-        #pic = pic.reshape(pic.shape[0], pic.shape[1], 1)
         return pic
         
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  
+
+    targets = targets = [imread(f)[...,:3]/255. for f in targetfiles]
+    targets = np.stack(targets, -1)
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs
+    print('Loaded target image data', targets.shape, poses[:,-1,0])
+    return poses, bds, imgs, targets
 
     
             
@@ -247,13 +259,14 @@ def spherify_poses(poses, bds):
 def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
     
 
-    poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
+    poses, bds, imgs, targets = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    targets = np.moveaxis(targets, -1, 0).astype(np.float32)
     images = imgs
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
@@ -315,9 +328,10 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     print('HOLDOUT view is', i_test)
     
     images = images.astype(np.float32)
+    targets = targets.astype(np.float32)
     poses = poses.astype(np.float32)
 
-    return images, poses, bds, render_poses, i_test
+    return images, targets, poses, bds, render_poses, i_test
 
 
 
