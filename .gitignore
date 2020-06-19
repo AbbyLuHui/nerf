@@ -4,6 +4,7 @@
 *.mp4
 *.npy
 *.npz
+*.npz.1
 *.dae
 data/*
 logs/*

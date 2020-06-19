@@ -17,35 +17,56 @@ from load_blender import load_blender_data
 tf.compat.v1.enable_eager_execution()
 
 
-def batchify(fn, chunk):
+def batchify(fn, chunk, feature_vector):
     """Constructs a version of 'fn' that applies to smaller batches."""
     if chunk is None:
         return fn
+    #intermediate = fn.get_layer('tf_op_layer_concat_4').output
+    #dotted = tf.keras.layers.Dot(axes=-1)([intermediate, intermediate])
+    #print("-----------------------------", dotted.shape)
 
     def ret(inputs):
-        return tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+        output = []
+        for i in range(0, inputs.shape[0], chunk):
+            output.append(fn(inputs[i:i+chunk]))
+        output = tf.concat(output, 0)
+        #output = tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+        #print('----------------------------------', fn.get_layer('tf_op_layer_concat_4').output)
+        #output shape: (65536, 4)
+        return output
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, viewdirs, fn, feature_vectors, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
 
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
 
     embedded = embed_fn(inputs_flat)
+    #embedded shape:  (2097152, 63)
     if viewdirs is not None:
+        #viewdir shape:  (32768, 3); viewdirs[0] shape: (3,0)
         input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
+        #inputdir shape:  (32768, 64, 3)
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        #input_dirs_flat:  (2097152, 3)
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+        #embeded_dir:  (2097152, 27)
         embedded = tf.concat([embedded, embedded_dirs], -1)
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
+
+    #embeded shape: (2097152, 90)
+    outputs_flat = batchify(fn, netchunk, feature_vectors)(embedded)
+    #outputs_flat.shape: (2097152, 4)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    #output shape: (32768, 64, 4)
+    #print('----------------------------------', fn.get_layer('tf_op_layer_concat_4').output)
     return outputs
 
 
-def render_rays(ray_batch,
+def render_rays(feature_vectors,
+                ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
@@ -89,7 +110,6 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-    #print('----------------------------------', network_fn.get_layer('tf_op_layer_concat_4').output[... , :3])
 
     def raw2outputs(raw, z_vals, rays_d):
         """Transforms model's predictions to semantically meaningful values.
@@ -202,12 +222,9 @@ def render_rays(ray_batch,
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
-    print("-------------------------------", rays_o[..., None, :].shape)
-    print("-------------------------------", rays_d[..., None, :].shape)
-    print("-------------------------------", z_vals[..., :, None].shape)
 
     # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+    raw = network_query_fn(pts, viewdirs, network_fn, feature_vectors)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
 
@@ -228,7 +245,7 @@ def render_rays(ray_batch,
 
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, viewdirs, run_fn, feature_vectors)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
@@ -247,11 +264,11 @@ def render_rays(ray_batch,
     return ret
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, feature_vector, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(feature_vector, rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -261,7 +278,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal,
+def render(H, W, focal, feature_vector,
            chunk=1024*32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,
@@ -272,6 +289,7 @@ def render(H, W, focal,
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
       focal: float. Focal length of pinhole camera.
+      feature_vector: Model to output intermediate feature vector.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -329,7 +347,7 @@ def render(H, W, focal,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, feature_vector, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
@@ -340,7 +358,7 @@ def render(H, W, focal,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, chunk, render_kwargs, feature_vector, gt_imgs=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
 
@@ -358,7 +376,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
-            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+            H, W, focal, feature_vector, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
         if i == 0:
@@ -413,8 +431,8 @@ def create_nerf(args):
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
 
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(
-        inputs, viewdirs, network_fn,
+    def network_query_fn(inputs, viewdirs, network_fn, feature_vectors): return run_network(
+        inputs, viewdirs, network_fn, feature_vectors,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
         netchunk=args.netchunk)
@@ -500,7 +518,7 @@ def config_parser():
                         help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64,
                         help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_true',
+    parser.add_argument("--no_batching", action='store_false',
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_false',
                         help='do not reload weights from saved ckpt')
@@ -559,7 +577,7 @@ def config_parser():
     # llff flags
     parser.add_argument("--factor", type=int, default=8,
                         help='downsample factor for LLFF images')
-    parser.add_argument("--no_ndc", action='store_true',
+    parser.add_argument("--no_ndc", action='store_false',
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
     parser.add_argument("--lindisp", action='store_true',
                         help='sampling linearly in disparity rather than depth')
@@ -682,6 +700,8 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference = create_nerf(
         args)
 
+    feature_vector = tf.keras.Model(inputs=models['model'].input, outputs=models['model'].get_layer('tf_op_layer_concat_4').output)
+
     bds_dict = {
         'near': tf.cast(near, tf.float32),
         'far': tf.cast(far, tf.float32),
@@ -704,7 +724,7 @@ def train():
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
+        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test, feature_vector,
                               gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
         print('Done rendering', testsavedir)
         imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
@@ -775,7 +795,21 @@ def train():
 
     for i in range(start, N_iters):
         time0 = time.time()
-
+        """img_i=1
+        ref = targets[img_i]
+        ref_pose = poses[img_i, :3, :4]
+        ref_rays_o, ref_rays_d = get_rays(H, W, focal, ref_pose)
+        print("ref_rays_o shape: ", ref_rays_o.shape)
+        ref_coords = tf.stack(tf.meshgrid(tf.range(H), tf.range(W), indexing='ij'), -1)
+        ref_select_inds = np.random.choice(
+            ref_coords.shape[0], size=[N_rand], replace=False)
+        #ref_select_inds = tf.gather_nd(ref_coords, ref_select_inds[:, tf.newaxis])
+        ref_rays_o = tf.gather_nd(ref_rays_o, ref_select_inds)
+        ref_rays_d = tf.gather_nd(ref_rays_d, ref_select_inds)
+        ref_batch_rays = tf.stack([ref_rays_o, ref_rays_d], 0)"""
+        #rgb, disp, acc, extras = render(
+        #    H, W, focal, feature_vector, chunk=args.chunk, rays=ref_batch_rays,
+        #    verbose=i < 10, retraw=True, **render_kwargs_train)
 
         # Sample random ray batch
 
@@ -790,7 +824,10 @@ def train():
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
             batch_rays, target_s = batch[:2], batch[2]
+            #batch_rays shape:  (2, 1024, 3)
+
             target_s_rgb = target_batch[2]
+            #target_s shape: (1024, 3)
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
@@ -822,8 +859,13 @@ def train():
                 select_inds = np.random.choice(
                     coords.shape[0], size=[N_rand], replace=False)
                 select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
+                #rays_o shape:  (378, 504, 3)
+                #rays_d shape:  (378, 504, 3)
+                #select_inds:  (1024, 2)
                 rays_o = tf.gather_nd(rays_o, select_inds)
                 rays_d = tf.gather_nd(rays_d, select_inds)
+                #rays_o shape after:  (1024, 3)
+                #rays_d shape after:  (1024, 3)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
                 target_s_rgb = tf.gather_nd(target_rgb, select_inds)
@@ -834,18 +876,18 @@ def train():
 
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
-                H, W, focal, chunk=args.chunk, rays=batch_rays,
+                H, W, focal, feature_vector, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s)
+            img_loss = img2mse(rgb, target_s_rgb)
             trans = extras['raw'][..., -1]
             loss = img_loss
             psnr = mse2psnr(img_loss)
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
+                img_loss0 = img2mse(extras['rgb0'], target_s_rgb)
                 loss += img_loss0
                 psnr0 = mse2psnr(img_loss0)
 
@@ -871,7 +913,7 @@ def train():
         if i % args.i_video == 0 and i > 0:
 
             rgbs, disps = render_path(
-                render_poses, hwf, args.chunk, render_kwargs_test)
+                render_poses, hwf, args.chunk, render_kwargs_test, feature_vector)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
@@ -883,7 +925,7 @@ def train():
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
                 rgbs_still, _ = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test)
+                    render_poses, hwf, args.chunk, render_kwargs_test, feature_vector)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
                                  to8b(rgbs_still), fps=30, quality=8)
@@ -893,7 +935,7 @@ def train():
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
-            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
+            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, feature_vector,
                         gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
@@ -915,7 +957,7 @@ def train():
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
 
-                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                rgb, disp, acc, extras = render(H, W, focal, feature_vector, chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
 
                 psnr = mse2psnr(img2mse(rgb, target))
