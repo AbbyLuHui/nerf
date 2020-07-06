@@ -577,7 +577,7 @@ def config_parser():
     # llff flags
     parser.add_argument("--factor", type=int, default=8,
                         help='downsample factor for LLFF images')
-    parser.add_argument("--no_ndc", action='store_false',
+    parser.add_argument("--no_ndc", action='store_true',
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
     parser.add_argument("--lindisp", action='store_true',
                         help='sampling linearly in disparity rather than depth')
@@ -595,7 +595,7 @@ def config_parser():
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=5000,
+    parser.add_argument("--i_video",   type=int, default=100001,
                         help='frequency of render_poses video saving')
 
     return parser
@@ -617,6 +617,8 @@ def train():
         images, targets, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
+        print("---------------------------------------------")
+        print("bds: ", bds)
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print('Loaded llff', images.shape,
@@ -700,7 +702,8 @@ def train():
     render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference = create_nerf(
         args)
 
-    feature_vector = tf.keras.Model(inputs=models['model'].input, outputs=models['model'].get_layer('tf_op_layer_concat_4').output)
+    #feature_vector = tf.keras.Model(inputs=models['model'].input, outputs=models['model'].get_layer('tf_op_layer_concat_4').output)
+    feature_vector = None
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -782,7 +785,7 @@ def train():
         i_batch = 0
 
     #N_iters = 1000000
-    N_iters=5010
+    N_iters=100010
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -915,6 +918,7 @@ def train():
             rgbs, disps = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test, feature_vector)
             print('Done, saving', rgbs.shape, disps.shape)
+            disps = tf.clip_by_value(disps, clip_value_min=-15, clip_value_max=15)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4',
