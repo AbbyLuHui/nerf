@@ -6,5 +6,6 @@
 *.npz
 *.npz.1
 *.dae
+*.txt
 data/*
 logs/*

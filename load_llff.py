@@ -62,6 +62,7 @@ def _minify(basedir, factors=[], resolutions=[]):
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
+    print("poses arr shape: ", poses_arr.shape)
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
     bds = poses_arr[:, -2:].transpose([1,0])
     
@@ -89,7 +90,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         factor = 1
     
     imgdir = os.path.join(basedir, 'images' + sfx)
-    targetdir = os.path.join(basedir, 'images' + sfx + '_rgb')
+    targetdir = os.path.join(basedir, 'images_rgb' + sfx)
     if not os.path.exists(imgdir):
         print( imgdir, 'does not exist, returning' )
         return
@@ -123,10 +124,10 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             pic = imageio.imread(f)
         return pic
         
-    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+    imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  
 
-    targets = targets = [imread(f)[...,:3]/255. for f in targetfiles]
+    targets = [imread(f)[...,:3]/255. for f in targetfiles]
     targets = np.stack(targets, -1)
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])

@@ -17,7 +17,7 @@ from load_blender import load_blender_data
 tf.compat.v1.enable_eager_execution()
 
 
-def batchify(fn, chunk, feature_vector):
+def batchify_colorize(fn, fn2, fn_feature, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
     if chunk is None:
         return fn
@@ -27,17 +27,37 @@ def batchify(fn, chunk, feature_vector):
 
     def ret(inputs):
         output = []
+        outputs2 = []
+        outputs_feature = []
         for i in range(0, inputs.shape[0], chunk):
-            output.append(fn(inputs[i:i+chunk]))
+            output_raw = fn(inputs[i:i+chunk])
+            output.append(output_raw[0])
+            output2_raw = fn2([inputs[i:i+chunk], output_raw[1], output_raw[2]])
+            outputs2.append(output2_raw)
+            output_feature = fn_feature(output_raw[1])
+            outputs_feature.append(fn2([inputs[i:i+chunk], output_feature, output_raw[2]]))
         output = tf.concat(output, 0)
+        outputs2 = tf.concat(outputs2, 0)
+        outputs_feature = tf.concat(outputs_feature, 0)
+
         #output = tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
         #print('----------------------------------', fn.get_layer('tf_op_layer_concat_4').output)
         #output shape: (65536, 4)
+        return output, outputs2, outputs_feature
+    return ret
+
+def batchify_nerf(fn, chunk):
+    if chunk is None:
+        return fn
+
+    def ret(inputs):
+        output = tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
         return output
     return ret
 
 
-def run_network(inputs, viewdirs, fn, feature_vectors, embed_fn, embeddirs_fn, netchunk=1024*64):
+
+def run_network_colorize(inputs, viewdirs, fn, fn2, fn_feature, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
 
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
@@ -56,25 +76,55 @@ def run_network(inputs, viewdirs, fn, feature_vectors, embed_fn, embeddirs_fn, n
 
 
     #embeded shape: (2097152, 90)
-    outputs_flat = batchify(fn, netchunk, feature_vectors)(embedded)
+    outputs_flat, outputs2_flat, outputs_ft_flat = batchify_colorize(fn, fn2, fn_feature, netchunk)(embedded)
     #outputs_flat.shape: (2097152, 4)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    outputs2 = tf.reshape(outputs2_flat, list(
+        inputs.shape[:-1]) + [outputs2_flat.shape[-1]])
+    outputs_ft = tf.reshape(outputs_ft_flat, list(
+        inputs.shape[:-1]) + [outputs_ft_flat.shape[-1]])
     #output shape: (32768, 64, 4)
     #print('----------------------------------', fn.get_layer('tf_op_layer_concat_4').output)
+    return outputs, outputs2, outputs_ft
+
+def run_network_nerf(inputs, time_step, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+    """Prepares inputs and applies network 'fn'."""
+
+    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
+
+    embedded = embed_fn(inputs_flat)
+    if viewdirs is not None:
+        input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
+        input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        embedded_dirs = embeddirs_fn(input_dirs_flat)
+        embedded = tf.concat([embedded, embedded_dirs], -1)
+
+    if time_step is not None:
+        time_step = tf.fill([embedded.shape[0], 5], float(time_step))
+        embedded = tf.concat([embedded, time_step], -1)
+
+
+    outputs_flat = batchify_nerf(fn, netchunk)(embedded)
+    outputs = tf.reshape(outputs_flat, list(
+        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
 
-def render_rays(feature_vectors,
+def render_rays(time_step,
                 ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
+                network_fn_2=None,
+                network_fn_feature=None,
                 retraw=False,
                 lindisp=False,
                 perturb=0.,
                 N_importance=0,
                 network_fine=None,
+                network_fine_2=None,
+                network_fine_feature = None,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False):
@@ -189,6 +239,7 @@ def render_rays(feature_vectors,
 
     # Extract ray origin, direction.
     rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
+    #rays_o: (1024, 3)
 
     # Extract unit-normalized viewing direction.
     viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
@@ -222,14 +273,40 @@ def render_rays(feature_vectors,
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    #pts: (1024, 64, 3)
+    #if time_step != None:
+    #    pts = tf.concat([pts, tf.fill([pts.shape[0], pts.shape[1], 1], float(time_step))], axis=-1)
+
 
     # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn, feature_vectors)  # [N_rays, N_samples, 4]
+    if network_fn_2==None: # nerf or dynamic
+        raw = network_query_fn(pts, time_step, viewdirs, network_fn, network_fn_2, network_fn_feature)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+            raw, z_vals, rays_d)
+
+        #TODO: fine model currently not supported for nerf
+        ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+        if retraw:
+            ret['raw'] = raw
+        for k in ret:
+            tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
+
+        return ret
+
+
+
+    raw, raw2, raw_ft = network_query_fn(pts, viewdirs, network_fn, network_fn_2, network_fn_feature)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
+    rgb_map2, disp_map2, acc_map2, weights2, depth_map2 = raw2outputs(
+        raw2, z_vals, rays_d)
+    rgb_map_ft, disp_map_ft, acc_map_ft, weights_ft, depth_map_ft = raw2outputs(
+        raw_ft, z_vals, rays_d)
 
     if N_importance > 0:
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map2_0, disp_map2_0, acc_map2_0 = rgb_map2, disp_map2, acc_map2
+        rgb_map_ft_0, disp_map_ft_0, acc_map_ft_0 = rgb_map_ft, disp_map_ft, acc_map_ft
 
         # Obtain additional integration times to evaluate based on the weights
         # assigned to colors in the coarse model.
@@ -245,11 +322,19 @@ def render_rays(feature_vectors,
 
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn, feature_vectors)
+        run_fn_2 = network_fn_2 if network_fine_2 is None else network_fine_2
+        run_fn_feature = network_fn_feature if network_fine_feature is None else network_fine_feature
+
+        raw, raw2, raw_ft = network_query_fn(pts, viewdirs, run_fn, run_fn_2, run_fn_feature)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
+        rgb_map2, disp_map2, acc_map2, weights2, depth_map2 = raw2outputs(
+            raw, z_vals, rays_d)
+        rgb_map_ft, disp_map_ft, acc_map_ft, weights_ft, depth_map_ft = raw2outputs(
+            raw, z_vals, rays_d)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'rgb_map2': rgb_map2, 'disp_map2': disp_map2,
+           'acc_map2': acc_map2, 'rgb_map_ft': rgb_map_ft, 'disp_map_ft': disp_map_ft, 'acc_map_ft': acc_map_ft}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -257,6 +342,12 @@ def render_rays(feature_vectors,
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
+        ret['rgb2_0'] = rgb_map2_0
+        ret['disp2_0'] = disp_map2_0
+        ret['acc2_0'] = disp_map2_0
+        ret['rgb_ft_0'] = rgb_map_ft_0
+        ret['disp_ft_0'] = disp_map_ft_0
+        ret['acc_ft_0'] = acc_map_ft_0
 
     for k in ret:
         tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
@@ -264,11 +355,11 @@ def render_rays(feature_vectors,
     return ret
 
 
-def batchify_rays(rays_flat, feature_vector, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, time_step, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(feature_vector, rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(time_step, rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -278,7 +369,7 @@ def batchify_rays(rays_flat, feature_vector, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal, feature_vector,
+def render(H, W, focal, time_step=None,
            chunk=1024*32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,
@@ -289,7 +380,6 @@ def render(H, W, focal, feature_vector,
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
       focal: float. Focal length of pinhole camera.
-      feature_vector: Model to output intermediate feature vector.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -315,6 +405,7 @@ def render(H, W, focal, feature_vector,
     else:
         # use provided ray batch
         rays_o, rays_d = rays
+
 
     if use_viewdirs:
         # provide ray directions as input
@@ -347,18 +438,21 @@ def render(H, W, focal, feature_vector,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, feature_vector, chunk, **kwargs)
+    all_ret = batchify_rays(rays, time_step, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    if 'rgb_map_ft' in all_ret:
+        k_extract = ['rgb_map', 'disp_map', 'acc_map', 'rgb_map2', 'disp_map2', 'acc_map2', 'rgb_map_ft', 'disp_map_ft', 'acc_map_ft']
+    else:
+        k_extract = ['rgb_map', 'disp_map', 'acc_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, chunk, render_kwargs, feature_vector, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
 
@@ -371,20 +465,42 @@ def render_path(render_poses, hwf, chunk, render_kwargs, feature_vector, gt_imgs
     rgbs = []
     disps = []
 
+    rgbs2 = []
+    disps2 = []
+
+    rgbs_ft = []
+    disps_ft = []
+
     t = time.time()
+    args = config_parser().parse_args()
     for i, c2w in enumerate(render_poses):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(
-            H, W, focal, feature_vector, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        if args.model_type=='nerf':
+            rgb, disp, acc, _ = render(
+            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        elif args.model_type=='dynamic':
+            rgb, disp, acc, _ = render(
+                H, W, focal, time_step=i / len(render_poses), chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        elif args.model_type=='colorization':
+            rgb, disp, acc, rgb2, disp2, acc2, rgb_ft, disp_ft, acc_ft, _ = render(
+                H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+            rgbs2.append(rgb2.numpy())
+            disps2.append(disp2.numpy())
+            rgbs_ft.append(rgb_ft.numpy())
+            disps_ft.append(disp_ft.numpy())
+        else:
+            print("ERROR: wrong model type")
+
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
+
         if i == 0:
             print(rgb.shape, disp.shape)
 
         if gt_imgs is not None and render_factor == 0:
             p = -10. * np.log10(np.mean(np.square(rgb - gt_imgs[i])))
-            print(p)
+            #print(p)
 
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
@@ -393,8 +509,15 @@ def render_path(render_poses, hwf, chunk, render_kwargs, feature_vector, gt_imgs
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+    if len(rgbs2) > 0:
+        rgbs2 = np.stack(rgbs2, 0)
+        disps2 = np.stack(disps, 0)
+        rgbs_ft = np.stack(rgbs_ft, 0)
+        disps_ft = np.stack(disps_ft, 0)
 
-    return rgbs, disps
+        return rgbs, disps, rgbs2, disps2, rgbs_ft, disps_ft
+    else:
+        return rgbs, disps
 
 
 def create_nerf(args):
@@ -408,46 +531,122 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(
             args.multires_views, args.i_embed)
     output_ch = 4
-    skips = [4]
-    reference_model = init_nerf_model(
-        reference_frame='True',
-        D=args.netdepth, W=args.netwidth,
-        input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-    model = init_nerf_model(
-        D=args.netdepth, W=args.netwidth,
-        input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-    
-    grad_vars = model.trainable_variables
-    models = {'model': model}
+    skips = [4, 10]
 
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = init_nerf_model(
-            D=args.netdepth_fine, W=args.netwidth_fine,
-            input_ch=input_ch, output_ch=output_ch, skips=skips,
-            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
-        grad_vars += model_fine.trainable_variables
-        models['model_fine'] = model_fine
-
-    def network_query_fn(inputs, viewdirs, network_fn, feature_vectors): return run_network(
-        inputs, viewdirs, network_fn, feature_vectors,
+    def network_query_fn_colorize(inputs, viewdirs, network_fn, network_fn_2, network_fn_feature): return run_network_colorize(
+        inputs, viewdirs, network_fn, network_fn_2, network_fn_feature,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
         netchunk=args.netchunk)
 
-    render_kwargs_train = {
-        'network_query_fn': network_query_fn,
-        'perturb': args.perturb,
-        'N_importance': args.N_importance,
-        'network_fine': model_fine,
-        'N_samples': args.N_samples,
-        'network_fn': model,
-        'use_viewdirs': args.use_viewdirs,
-        'white_bkgd': args.white_bkgd,
-        'raw_noise_std': args.raw_noise_std,
-    }
+    def network_query_fn_nerf(inputs, time_step, viewdirs, network_fn, network_fn_2, network_fn_feature): return run_network_nerf(
+        inputs, time_step, viewdirs, network_fn,
+        embed_fn=embed_fn,
+        embeddirs_fn=embeddirs_fn,
+        netchunk=args.netchunk)
+
+
+    if args.model_type=='colorization':
+        model, model2, model_feature = init_nerf_model_colorize(feature_vector=256,
+            D=args.netdepth, W=args.netwidth,
+            input_ch=input_ch, output_ch=output_ch, skips=skips,
+            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+
+        grad_vars = {}
+        grad_vars['prior'] = model.trainable_variables
+        grad_vars['model'] = model2.trainable_variables
+        grad_vars['feature'] = model_feature.trainable_variables
+        models = {'model': model, 'model2': model2, 'model_feature':model_feature}
+
+        model_fine = None
+        model2_fine = None
+        model_feature_fine = None
+        if args.N_importance > 0:
+            model_fine, model2_fine, model_feature_fine = init_nerf_model_colorize(feature_vector=256,
+                D=args.netdepth_fine, W=args.netwidth_fine,
+                input_ch=input_ch, output_ch=output_ch, skips=skips,
+                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+            grad_vars['prior'] += model_fine.trainable_variables
+            grad_vars['model'] += model2_fine.trainable_variables
+            grad_vars['feature'] += model_feature_fine.trainable_variables
+            models['model_fine'] = model_fine
+            models['model2_fine'] = model2_fine
+            models['model_feature_fine'] = model_feature_fine
+
+        render_kwargs_train = {
+            'network_query_fn': network_query_fn_colorize,
+            'perturb': args.perturb,
+            'N_importance': args.N_importance,
+            'network_fine': model_fine,
+            'network_fine_2': model2_fine,
+            'network_fine_feature': model_feature_fine,
+            'N_samples': args.N_samples,
+            'network_fn': model,
+            'network_fn_2': model2,
+            'network_fn_feature': model_feature,
+            'use_viewdirs': args.use_viewdirs,
+            'white_bkgd': args.white_bkgd,
+            'raw_noise_std': args.raw_noise_std,
+        }
+
+    elif args.model_type=='dynamic':
+        model = init_nerf_model_dynamic(
+                                D=args.netdepth, W=args.netwidth,
+                                input_ch=input_ch, input_time=5, output_ch=output_ch, skips=skips,
+                                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        models = {'model': model}
+        grad_vars = model.trainable_variables
+        model_fine = None
+        if args.N_importance > 0:
+            model_fine = init_nerf_model_dynamic(D=args.netdepth_fine, W=args.netwidth_fine,
+                                         input_ch=input_ch, input_time=5, output_ch=output_ch, skips=skips,
+                                         input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+            grad_vars += model_fine.trainable_variables
+            models['model_fine'] = model_fine
+        render_kwargs_train = {
+            'network_query_fn': network_query_fn_nerf,
+            'perturb': args.perturb,
+            'N_importance': args.N_importance,
+            'network_fine': model_fine,
+            'N_samples': args.N_samples,
+            'network_fn': model,
+            'use_viewdirs': args.use_viewdirs,
+            'white_bkgd': args.white_bkgd,
+            'raw_noise_std': args.raw_noise_std,
+        }
+
+    elif args.model_type=='nerf':
+        model = init_nerf_model(feature_vector=256,
+                                D=args.netdepth, W=args.netwidth,
+                                input_ch=input_ch, output_ch=output_ch, skips=skips,
+                                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        models={'model': model}
+        grad_vars = model.trainable_variables
+        model_fine = None
+        if args.N_importance > 0:
+            model_fine = init_nerf_model(feature_vector=256,
+                D=args.netdepth_fine, W=args.netwidth_fine,
+                input_ch=input_ch, output_ch=output_ch, skips=skips,
+                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+            grad_vars += model_fine.trainable_variables
+            models['model_fine'] = model_fine
+        render_kwargs_train = {
+            'network_query_fn': network_query_fn_nerf,
+            'perturb': args.perturb,
+            'N_importance': args.N_importance,
+            'network_fine': model_fine,
+            'N_samples': args.N_samples,
+            'network_fn': model,
+            'use_viewdirs': args.use_viewdirs,
+            'white_bkgd': args.white_bkgd,
+            'raw_noise_std': args.raw_noise_std,
+        }
+
+
+
+
+
+
 
     # NDC only good for LLFF-style forward facing data
     if args.dataset_type != 'llff' or args.no_ndc:
@@ -467,14 +666,27 @@ def create_nerf(args):
     if args.ft_path is not None and args.ft_path != 'None':
         ckpts = [args.ft_path]
     else:
+        ckpts_ft = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
+                 ('model_feature' in f and 'fine' not in f and 'optimizer' not in f)]
+        ckpts2 = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
+                 ('model2' in f and 'fine' not in f and 'optimizer' not in f)]
         ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
-                 ('model_' in f and 'fine' not in f and 'optimizer' not in f)]
+                 ('model_' in f and 'feature' not in f and 'fine' not in f and 'optimizer' not in f)]
     print('Found ckpts', ckpts)
+
+    #reload model_ft weights and accumulate across scenes
+    ft_weight_path = os.path.join(basedir, 'mannequin8001', 'model_ft.npy')
+    if args.model_type=='colorization' and os.path.exists(ft_weight_path):
+        model_feature.set_weights(np.load(ft_weight_path, allow_pickle=True))
+        print("Reload model feature")
+
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
-        print('Reloading from', ft_weights)
+        print('Reloading from', ft_weights, ckpts2[-1], ckpts_ft[-1])
         a = np.load(ft_weights, allow_pickle=True)
         model.set_weights(np.load(ft_weights, allow_pickle=True))
+        model2.set_weights(np.load(ckpts2[-1], allow_pickle=True))
+        model_feature.set_weights(np.load(ckpts_ft[-1], allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         print('Resetting step to', start)
 
@@ -483,8 +695,12 @@ def create_nerf(args):
                 ft_weights[:-11], ft_weights[-10:])
             print('Reloading fine from', ft_weights_fine)
             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
-
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference_model
+    #if len(ckpts) > 0  and args.evaluate:
+    #    ft_weights = ckpts_ft[-1]
+    #    print("Reload feature model for evaluation ", ft_weights)
+    #    model_feature.set_weights(np.load(ft_weights, allow_pickle=True))
+        #fine model not included
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
 
 def config_parser():
@@ -494,10 +710,10 @@ def config_parser():
     parser.add_argument('--config', is_config_file=True,
                         help='config file path')
     parser.add_argument("--expname", type=str, help='experiment name')
-    parser.add_argument("--basedir", type=str, default='./logs/',
+    parser.add_argument("--basedir", type=str, default='./logs',
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str,
-                        default='./data/llff/fern', help='input data directory')
+                        default='/local/vondrick/abby/CATER/CATER_new_000014', help='input data directory')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8,
@@ -508,7 +724,7 @@ def config_parser():
                         default=8, help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=32*32*4,
+    parser.add_argument("--N_rand", type=int, default=32*32,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float,
                         default=5e-4, help='learning rate')
@@ -524,7 +740,7 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None,
                         help='specific weights npy file to reload for coarse network')
-    parser.add_argument("--random_seed", type=int, default=None,
+    parser.add_argument("--random_seed", type=int, default=0,
                         help='fix random seed for repeatability')
     
     # pre-crop options
@@ -540,7 +756,7 @@ def config_parser():
                         help='number of additional fine samples per ray')
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
-    parser.add_argument("--use_viewdirs", action='store_true',
+    parser.add_argument("--use_viewdirs", action='store_false',
                         help='use full 5D input instead of 3D')
     parser.add_argument("--i_embed", type=int, default=0,
                         help='set 0 for default positional encoding, -1 for none')
@@ -557,6 +773,13 @@ def config_parser():
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0,
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--evaluate", action='store_true',
+                        help='evaluating instead of training feature transformation')
+    parser.add_argument("--render_camera", action='store_true',
+                        help='render from camera poses')
+    parser.add_argument("--model_type", type=str, default='colorization',
+                        help='options: colorization / dynamic / nerf')
+
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff',
@@ -575,7 +798,7 @@ def config_parser():
                         help='load blender synthetic data at 400x400 instead of 800x800')
 
     # llff flags
-    parser.add_argument("--factor", type=int, default=8,
+    parser.add_argument("--factor", type=int, default=1,
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true',
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
@@ -589,19 +812,19 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_img",     type=int, default=500,
+    parser.add_argument("--i_img",     type=int, default=8000,
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000,
+    parser.add_argument("--i_weights", type=int, default=50000,
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=100001,
+    parser.add_argument("--i_video",   type=int, default=10000,
                         help='frequency of render_poses video saving')
 
     return parser
 
 
-def train():
+def train(datadir, expname):
 
     parser = config_parser()
     args = parser.parse_args()
@@ -614,15 +837,16 @@ def train():
     # Load data
 
     if args.dataset_type == 'llff':
-        images, targets, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
-        print("---------------------------------------------")
-        print("bds: ", bds)
+        #images, targets, poses, bds, render_poses, i_test = load_llff_data(datadir, args.factor,
+        #                                                          recenter=True, bd_factor=.75,
+        #                                                          spherify=args.spherify)
+        images, targets, poses, bds, render_poses, i_test = load_llff_data(datadir, None,
+                                                                        recenter=True, bd_factor=.75,
+                                                                        spherify=args.spherify)
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print('Loaded llff', images.shape,
-              render_poses.shape, hwf, args.datadir)
+              render_poses.shape, hwf, datadir)
         if not isinstance(i_test, list):
             i_test = [i_test]
 
@@ -645,9 +869,9 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip)
+            datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape,
-              render_poses.shape, hwf, args.datadir)
+              render_poses.shape, hwf, datadir)
         i_train, i_val, i_test = i_split
 
         near = 2.
@@ -661,11 +885,11 @@ def train():
     elif args.dataset_type == 'deepvoxels':
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
-                                                                 basedir=args.datadir,
+                                                                 basedir=datadir,
                                                                  testskip=args.testskip)
 
         print('Loaded deepvoxels', images.shape,
-              render_poses.shape, hwf, args.datadir)
+              render_poses.shape, hwf, datadir)
         i_train, i_val, i_test = i_split
 
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
@@ -686,7 +910,7 @@ def train():
 
     # Create log dir and copy the config file
     basedir = args.basedir
-    expname = args.expname
+    args.expname = expname
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
@@ -699,11 +923,9 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models, reference = create_nerf(
+    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
         args)
 
-    #feature_vector = tf.keras.Model(inputs=models['model'].input, outputs=models['model'].get_layer('tf_op_layer_concat_4').output)
-    feature_vector = None
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -727,11 +949,11 @@ def train():
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test, feature_vector,
+        rgbs, disps, rgbs2, disps2, rgbs_ft, disps_ft  = render_path(poses, hwf, args.chunk, render_kwargs_test,
                               gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
         print('Done rendering', testsavedir)
         imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
-                         to8b(rgbs), fps=30, quality=8)
+                         to8b(rgbs_ft), fps=30, quality=8)
 
         return
 
@@ -785,7 +1007,7 @@ def train():
         i_batch = 0
 
     #N_iters = 1000000
-    N_iters=100010
+    N_iters=10001
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -798,21 +1020,6 @@ def train():
 
     for i in range(start, N_iters):
         time0 = time.time()
-        """img_i=1
-        ref = targets[img_i]
-        ref_pose = poses[img_i, :3, :4]
-        ref_rays_o, ref_rays_d = get_rays(H, W, focal, ref_pose)
-        print("ref_rays_o shape: ", ref_rays_o.shape)
-        ref_coords = tf.stack(tf.meshgrid(tf.range(H), tf.range(W), indexing='ij'), -1)
-        ref_select_inds = np.random.choice(
-            ref_coords.shape[0], size=[N_rand], replace=False)
-        #ref_select_inds = tf.gather_nd(ref_coords, ref_select_inds[:, tf.newaxis])
-        ref_rays_o = tf.gather_nd(ref_rays_o, ref_select_inds)
-        ref_rays_d = tf.gather_nd(ref_rays_d, ref_select_inds)
-        ref_batch_rays = tf.stack([ref_rays_o, ref_rays_d], 0)"""
-        #rgb, disp, acc, extras = render(
-        #    H, W, focal, feature_vector, chunk=args.chunk, rays=ref_batch_rays,
-        #    verbose=i < 10, retraw=True, **render_kwargs_train)
 
         # Sample random ray batch
 
@@ -874,28 +1081,127 @@ def train():
                 target_s_rgb = tf.gather_nd(target_rgb, select_inds)
 
         #####  Core optimization loop  #####
+        loss = 0
+        if args.model_type=='dynamic':
+            with tf.GradientTape() as tape:
+                rgb, disp, acc, extras = render(
+                    H, W, focal, time_step=img_i / len(images), chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+                loss_prior = img2mse(rgb, target_s_rgb)
+                trans = extras['raw'][..., -1]
+                psnr = mse2psnr(loss_prior)
 
-        with tf.GradientTape() as tape:
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss_prior += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
 
-            # Make predictions for color, disparity, accumulated opacity.
-            rgb, disp, acc, extras = render(
-                H, W, focal, feature_vector, chunk=args.chunk, rays=batch_rays,
-                verbose=i < 10, retraw=True, **render_kwargs_train)
+            gradients = tape.gradient(loss_prior, grad_vars)
+            optimizer.apply_gradients(zip(gradients, grad_vars))
+            loss = loss_prior
 
-            # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s_rgb)
-            trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
+            if i % args.i_print == 0 or i < 10:
+                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
 
-            # Add MSE loss for coarse-grained model
-            if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s_rgb)
-                loss += img_loss0
-                psnr0 = mse2psnr(img_loss0)
 
-        gradients = tape.gradient(loss, grad_vars)
-        optimizer.apply_gradients(zip(gradients, grad_vars))
+        elif args.model_type=='nerf':
+            with tf.GradientTape() as tape:
+                # Make predictions for color, disparity, accumulated opacity.
+                rgb, disp, acc, extras = render(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                #img_loss = img2mse(rgb_ft, target_s_rgb)
+                loss_prior = img2mse(rgb, target_s_rgb)
+                trans = extras['raw'][..., -1]
+                psnr = mse2psnr(loss_prior)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss_prior += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+
+            gradients = tape.gradient(loss_prior, grad_vars)
+            optimizer.apply_gradients(zip(gradients, grad_vars))
+            loss = loss_prior
+            #grads_prior = tape.gradient(loss_prior, grad_vars['prior'])
+            #gradients_prior = [grad if grad is not None else tf.zeros_like(var) for var, grad in zip(grad_vars['prior'], grads_prior)]
+            #optimizer.apply_gradients(zip(gradients_prior, grad_vars['prior']))
+
+            if i % args.i_print == 0 or i < 10:
+                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+
+
+
+        elif args.model_type=='colorization':
+            with tf.GradientTape() as tape:
+                # Make predictions for color, disparity, accumulated opacity.
+                rgb, disp, acc, rgb2, disp2, acc2, rgb_ft, disp_ft, acc_ft, extras = render(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                # Compute MSE loss between predicted and true RGB.
+                #img_loss = img2mse(rgb_ft, target_s_rgb)
+                loss_prior = img2mse(rgb, target_s)
+                trans = extras['raw'][..., -1]
+                psnr = mse2psnr(loss_prior)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss_prior += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+
+            grads_prior = tape.gradient(loss_prior, grad_vars['prior'])
+            gradients_prior = [grad if grad is not None else tf.zeros_like(var) for var, grad in zip(grad_vars['prior'], grads_prior)]
+            optimizer.apply_gradients(zip(gradients_prior, grad_vars['prior']))
+
+            with tf.GradientTape() as tape2:
+                # Make predictions for color, disparity, accumulated opacity.
+                rgb, disp, acc, rgb2, disp2, acc2, rgb_ft, disp_ft, acc_ft, extras = render(
+                    H, W, focal, chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                loss_model = img2mse(rgb2, target_s)
+                loss_feature = img2mse(rgb_ft, target_s_rgb)
+                if 'rgb2_0' in extras:
+                    loss_model += img2mse(extras['rgb2_0'], target_s)
+
+            grads_model = tape2.gradient(loss_model, grad_vars['model'])
+            gradients_model = [grad if grad is not None else tf.zeros_like(var) for var, grad in zip(grad_vars['model'], grads_model)]
+            optimizer.apply_gradients(zip(gradients_model, grad_vars['model']))
+
+            loss = loss_prior + loss_model
+
+            if i == 1000 and loss_prior > 0.01:
+                break
+
+
+            if not args.evaluate:
+                with tf.GradientTape() as tape3:
+                    # Make predictions for color, disparity, accumulated opacity.
+                    rgb, disp, acc, rgb2, disp2, acc2, rgb_ft, disp_ft, acc_ft, extras = render(
+                        H, W, focal, chunk=args.chunk, rays=batch_rays,
+                        verbose=i < 10, retraw=True, **render_kwargs_train)
+
+                    loss_feature = img2mse(rgb_ft, target_s_rgb)
+                    if 'rgb_ft_0' in extras:
+                        loss_feature += img2mse(extras['rgb_ft_0'], target_s_rgb)
+                grads_feature = tape3.gradient(loss_feature, grad_vars['feature'])
+                gradients_feature = [grad if grad is not None else tf.zeros_like(var) for var, grad in zip(grad_vars['feature'], grads_feature)]
+                optimizer.apply_gradients(zip(gradients_feature, grad_vars['feature']))
+            loss += loss_feature
+
+            if i % args.i_print == 0 or i < 10:
+                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+                print(loss_prior.numpy(), loss_model.numpy(), loss_feature.numpy())
+
+        else:
+            print("ERROR: wrong model type")
+            return
 
         dt = time.time()-time0
 
@@ -909,43 +1215,75 @@ def train():
             np.save(path, net.get_weights())
             print('saved weights at', path)
 
-        if i % args.i_weights == 0:
+        if i % args.i_weights == 0 and not args.evaluate:
             for k in models:
                 save_weights(models[k], k, i)
 
-        if i % args.i_video == 0 and i > 0:
+        if i==N_iters-1 and not args.evaluate and args.model_type=='colorization':
+            path = os.path.join(basedir, 'model_ft.npy')
+            np.save(path, models['model_feature'].get_weights())
+            print('saved model_ft weights')
 
-            rgbs, disps = render_path(
-                render_poses, hwf, args.chunk, render_kwargs_test, feature_vector)
-            print('Done, saving', rgbs.shape, disps.shape)
-            disps = tf.clip_by_value(disps, clip_value_min=-15, clip_value_max=15)
+        if i % args.i_video == 0 and i > 0:
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4',
-                             to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4',
-                             to8b(disps / np.max(disps)), fps=30, quality=8)
+            if args.model_type == 'colorization':
+                rgbs, disps, rgbs2, disps2, rgbs_ft, disps_ft = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test)
+                imageio.mimwrite(moviebase + 'rgb_ft.mp4',
+                                 to8b(rgbs_ft), fps=30, quality=8)
+            else:
+                rgbs, disps = render_path(
+                    render_poses, hwf, args.chunk, render_kwargs_test)
+                imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            print('Done, saving', rgbs.shape, disps.shape)
+            #disps = tf.clip_by_value(disps, clip_value_min=-15, clip_value_max=15)
+
+            #imageio.mimwrite(moviebase + 'rgb.mp4',
+            #                 to8b(rgbs), fps=30, quality=8)
+            #imageio.mimwrite(moviebase + 'disp.mp4',
+            #                 to8b(disps / np.max(disps)), fps=30, quality=8)
+            #imageio.mimwrite(moviebase + 'rgb2.mp4',
+            #                 to8b(rgbs2), fps=30, quality=8)
+            #imageio.mimwrite(moviebase + 'disp2.mp4',
+            #                 to8b(disps2 / np.max(disps2)), fps=30, quality=8)
+            #imageio.mimwrite(moviebase + 'rgb_ft.mp4',
+            #                 to8b(rgbs_ft), fps=30, quality=8)
+            #imageio.mimwrite(moviebase + 'disp_ft.mp4',
+            #                 to8b(disps_ft / np.max(disps_ft)), fps=30, quality=8)
+
+            if args.render_camera and args.model_type=='colorization':
+                rgbs, disps, rgbs2, disps2, rgbs_ft, disps_ft = render_path(
+                    poses, hwf, args.chunk, render_kwargs_test)
+                imageio.mimwrite(moviebase + 'rgb_ft_camera.mp4',
+                                 to8b(rgbs_ft), fps=30, quality=8)
+            elif args.render_camera:
+                rgbs, disps = render_path(
+                    poses, hwf, args.chunk, render_kwargs_test)
+                imageio.mimwrite(moviebase + 'rgb_camera.mp4',
+                                 to8b(rgbs), fps=30, quality=8)
 
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
-                rgbs_still, _ = render_path(
-                    render_poses, hwf, args.chunk, render_kwargs_test, feature_vector)
+                #rgbs_still, disps_still, rgbs2_still, disps2_still, rgbs_ft_still, disps_ft_still = render_path(
+                #    render_poses, hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
-                imageio.mimwrite(moviebase + 'rgb_still.mp4',
-                                 to8b(rgbs_still), fps=30, quality=8)
+                #imageio.mimwrite(moviebase + 'rgb_still.mp4',
+                #                 to8b(rgbs_still), fps=30, quality=8)
 
         if i % args.i_testset == 0 and i > 0:
             testsavedir = os.path.join(
                 basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
-            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test, feature_vector,
+            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
                         gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
 
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+            #print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+            #print(loss_prior.numpy(), loss_model.numpy(), loss_feature.numpy())
             print('iter time {:.05f}'.format(dt))
             with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
                 tf.contrib.summary.scalar('loss', loss)
@@ -961,8 +1299,14 @@ def train():
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
 
-                rgb, disp, acc, extras = render(H, W, focal, feature_vector, chunk=args.chunk, c2w=pose,
-                                                **render_kwargs_test)
+                if args.model_type == 'colorization':
+                    rgb, disp, acc, rgb2, disp2, acc2, rgb_ft, disp_ft, acc_ft, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                    **render_kwargs_test)
+                elif args.model_type == 'dynamic':
+                    rgb, disp, acc, extras = render(H, W, focal, time_step=img_i / len(images), chunk=args.chunk, c2w=pose, **render_kwargs_test)
+                else:
+                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                    **render_kwargs_test)
 
                 psnr = mse2psnr(img2mse(rgb, target))
                 
@@ -995,6 +1339,22 @@ def train():
 
         global_step.assign_add(1)
 
+def train_ft():
+    basedir = config_parser().parse_args().datadir
+    count = 0
+    for scene in sorted(os.listdir(basedir)):
+        if os.path.exists(os.path.join(basedir, scene, 'poses_bounds.npy')):
+            print('training: ', scene)
+            count += 1
+            train(datadir=os.path.join(basedir, scene), expname=scene)
+            if count > 200:
+                break
+
+
 
 if __name__ == '__main__':
-    train()
+    train_ft()
+    #basedir = config_parser().parse_args().datadir
+    #train(datadir=basedir, expname='CATER_new_000014')
+    #basedir = config_parser().parse_args().datadir
+    #train(datadir=os.path.join(basedir, '108d65300a99b40a'), expname='108d65300a99b40a')

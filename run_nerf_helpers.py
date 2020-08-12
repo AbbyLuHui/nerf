@@ -82,8 +82,104 @@ def get_embedder(multires, i=0):
 
 # Model architecture
 
-def init_nerf_model(reference_frame=None, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+def init_nerf_model_dynamic(D=8, W=256, input_ch=3, input_time=5, input_ch_views=3, output_ch=4, skips=[4,10], use_viewdirs=False):
+    relu = tf.keras.layers.ReLU()
 
+    def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
+
+    print('MODEL', input_ch, input_ch_views, type(
+        input_ch), type(input_ch_views), use_viewdirs)
+    input_ch = int(input_ch)
+    input_ch_views = int(input_ch_views)
+    input_time = int(input_time)
+
+    inputs = tf.keras.Input(shape=(input_ch + input_ch_views + input_time))
+    inputs_pts, inputs_views, inputs_time = tf.split(inputs, [input_ch, input_ch_views, input_time], -1)
+    inputs_pts.set_shape([None, input_ch])
+    inputs_views.set_shape([None, input_ch_views])
+    inputs_time.set_shape([None, input_time])
+
+    print(inputs.shape, inputs_pts.shape, inputs_views.shape, inputs_time.shape)
+    outputs = tf.concat([inputs_pts, inputs_time], -1)
+    for i in range(D):
+        outputs = dense(W)(outputs)
+        if i in skips:
+            outputs = tf.concat([inputs_pts, inputs_time, outputs], -1)
+
+    if use_viewdirs:
+        alpha_out = dense(1, act=None)(outputs)
+        bottleneck = dense(256, act=None)(outputs)
+        outputs = tf.concat([bottleneck, inputs_views], -1)
+        for i in range(1):
+            outputs = dense(W // 2)(outputs)
+
+        outputs = dense(3, act=None)(outputs)
+        outputs = tf.concat([outputs, alpha_out], -1)
+    else:
+        outputs = dense(output_ch, act=None)(outputs)
+
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+
+def init_nerf_model(feature_vector=256, D=8, W=256, input_ch=3, input_time=None, input_ch_views=3, output_ch=4,
+                    skips=[4, 10], use_viewdirs=False):
+    relu = tf.keras.layers.ReLU()
+
+    def dense(W, act=relu):
+        return tf.keras.layers.Dense(W, activation=act)
+
+    print('MODEL', input_ch, input_ch_views, type(
+        input_ch), type(input_ch_views), use_viewdirs)
+    input_ch = int(input_ch)
+    input_ch_views = int(input_ch_views)
+
+    inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
+
+
+    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    inputs_pts.set_shape([None, input_ch])
+    inputs_views.set_shape([None, input_ch_views])
+
+    print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+    outputs = inputs_pts
+
+    for i in range(D):
+        outputs = dense(W)(outputs)
+        if i in skips:
+            outputs = tf.concat([inputs_pts, outputs], -1)
+
+
+    if use_viewdirs:
+        alpha_out = dense(1, act=None)(outputs)
+        bottleneck = dense(256, act=None)(outputs)
+
+        inputs_viewdirs = tf.concat(
+            [bottleneck, inputs_views], -1)  # concat viewdirs
+        outputs = inputs_viewdirs
+        # The supplement to the paper states there are 4 hidden layers here, but this is an error since
+        # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
+
+        for i in range(1):
+            outputs = dense(W // 2)(outputs)
+
+        outputs = dense(3, act=None)(outputs)
+        outputs = tf.concat([outputs, alpha_out], -1)
+    else:
+        outputs = dense(output_ch, act=None)(outputs)
+
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+
+
+
+def init_nerf_model_colorize(feature_vector=256, D=8, W=256, input_ch=3, input_time=None, input_ch_views=3, output_ch=4, skips=[4, 10], use_viewdirs=False):
+
+    if input_time!=None:
+        return init_nerf_model_dynamic(D=D, W=W, input_ch=input_ch, input_time=input_time,
+                                       input_ch_views=input_ch_views, output_ch=output_ch,
+                                       skips=skips, use_viewdirs=use_viewdirs)
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
@@ -93,25 +189,48 @@ def init_nerf_model(reference_frame=None, D=8, W=256, input_ch=3, input_ch_views
     input_ch_views = int(input_ch_views)
 
     inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
-    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
-    inputs_pts.set_shape([None, input_ch])
-    inputs_views.set_shape([None, input_ch_views])
 
-    print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+    inputs2_coord = tf.keras.Input(shape=(input_ch + input_ch_views))
+    inputs2_feature = tf.keras.Input(shape=feature_vector)
+    feature_inputs = tf.keras.Input(shape=feature_vector)
+    alpha_in = tf.keras.Input(shape=1)
+
+    alpha_input = alpha_in
+
+    inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    inputs_pts_2, inputs_views_2 = tf.split(inputs2_coord, [input_ch, input_ch_views], -1)
+    inputs_pts.set_shape([None, input_ch])
+    inputs_pts_2.set_shape([None, input_ch])
+    inputs_views.set_shape([None, input_ch_views])
+    inputs_views_2.set_shape([None, input_ch_views])
+    inputs2_feature.set_shape([None, feature_vector])
+    alpha_input.set_shape([None, 1])
+
+    print(inputs.shape, inputs_pts.shape, inputs_views.shape, inputs2_coord.shape, inputs_pts_2.shape, inputs_views_2.shape)
     outputs = inputs_pts
+    alpha_input = dense(feature_vector//4)(alpha_input)
+    inputs_pts_2 = dense(feature_vector)(tf.concat([inputs_pts_2, alpha_input], -1))
+    outputs2 = tf.concat([inputs_pts_2, inputs2_feature], -1)
+
     for i in range(D):
         outputs = dense(W)(outputs)
         if i in skips:
             outputs = tf.concat([inputs_pts, outputs], -1)
+    for i in range(D):
+        outputs2 = dense(W)(outputs2)
+        if i in skips:
+            outputs2 = tf.concat([inputs_pts_2, outputs2], -1)
     
     if use_viewdirs:
         alpha_out = dense(1, act=None)(outputs)
+        alpha_out_2 = dense(1, act=None)(outputs2)
         bottleneck = dense(256, act=None)(outputs)
-        #compute similarity matrix between target frame and reference frame
+
 
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
         outputs = inputs_viewdirs
+        outputs2 = tf.concat([outputs2, inputs_views_2], -1)
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
 
@@ -123,16 +242,28 @@ def init_nerf_model(reference_frame=None, D=8, W=256, input_ch=3, input_ch_views
         #else:
 
         
-        #for i in range(1):
-        #    outputs = dense(W//2)(outputs)
+        for i in range(1):
+            outputs = dense(W//2)(outputs)
+        for i in range(1):
+            outputs2 = dense(W//2)(outputs2)
         
         outputs = dense(3, act=None)(outputs)
+        outputs2 = dense(3, act=None)(outputs2)
         outputs = tf.concat([outputs, alpha_out], -1)
+        outputs2 = tf.concat([outputs2, alpha_out_2], -1)
     else:
         outputs = dense(output_ch, act=None)(outputs)
+        outputs2 = dense(output_ch, act=None)(outputs2)
 
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    return model
+    outputs3 = feature_inputs
+    for i in range(D):
+        outputs3 = dense(feature_vector)(outputs3)
+        if i in skips:
+            outputs3 = tf.concat([feature_inputs, outputs3], -1)
+    model = tf.keras.Model(inputs=inputs, outputs=[outputs, bottleneck, alpha_out])
+    model2 = tf.keras.Model(inputs=[inputs2_coord, inputs2_feature, alpha_in], outputs=outputs2)
+    model3 = tf.keras.Model(inputs=feature_inputs, outputs=outputs3)
+    return model, model2, model3
 
 
 # Ray helpers
