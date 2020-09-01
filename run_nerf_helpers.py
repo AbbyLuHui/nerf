@@ -11,7 +11,7 @@ import json
 def img2mse(x, y): return tf.reduce_mean(tf.square(x - y))
 
 
-def mse2psnr(x): return -10.*tf.log(x)/tf.log(10.)
+def mse2psnr(x): return -10.*tf.math.log(x)/tf.math.log(10.)
 
 
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
@@ -118,7 +118,47 @@ def init_nerf_model_dynamic(D=8, W=256, input_ch=3, input_time=5, input_ch_views
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    model = tf.keras.Model(inputs=inputs, outputs=[outputs, bottleneck])
+    return model
+
+def init_nerf_model_cycle(D=8, W=256, input_ch=3, input_time=5, input_ch_views=3, output_ch=4, skips=[4,10], use_viewdirs=False):
+    relu = tf.keras.layers.ReLU()
+
+    def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
+
+    print('MODEL', input_ch, input_ch_views, type(
+        input_ch), type(input_ch_views), use_viewdirs)
+    input_ch = int(input_ch)
+    input_ch_views = int(input_ch_views)
+    input_time = int(input_time)
+
+    inputs = tf.keras.Input(shape=(input_ch + input_ch_views + input_time + W))
+    inputs_pts, inputs_views, inputs_time, feature_map = tf.split(inputs, [input_ch, input_ch_views, input_time, W], -1)
+    inputs_pts.set_shape([None, input_ch])
+    inputs_views.set_shape([None, input_ch_views])
+    inputs_time.set_shape([None, input_time])
+    feature_map.set_shape([None, W])
+
+    print(inputs.shape, inputs_pts.shape, inputs_views.shape, inputs_time.shape, feature_map.shape)
+    outputs = tf.concat([inputs_pts, inputs_time, feature_map], -1)
+    for i in range(D):
+        outputs = dense(W)(outputs)
+        if i in skips:
+            outputs = tf.concat([inputs_pts, inputs_time, outputs], -1)
+
+    if use_viewdirs:
+        alpha_out = dense(1, act=None)(outputs)
+        bottleneck = dense(W, act=None)(outputs)
+        outputs = tf.concat([bottleneck, inputs_views], -1)
+        for i in range(1):
+            outputs = dense(W // 2)(outputs)
+
+        outputs = dense(3, act=None)(outputs)
+        outputs = tf.concat([outputs, alpha_out], -1)
+    else:
+        outputs = dense(output_ch, act=None)(outputs)
+
+    model = tf.keras.Model(inputs=inputs, outputs=[outputs, bottleneck])
     return model
 
 
@@ -174,7 +214,7 @@ def init_nerf_model(feature_vector=256, D=8, W=256, input_ch=3, input_time=None,
 
 
 
-def init_nerf_model_colorize(feature_vector=256, D=8, W=256, input_ch=3, input_time=None, input_ch_views=3, output_ch=4, skips=[4, 10], use_viewdirs=False):
+def init_nerf_model_colorize(feature_vector=64, D=8, W=256, input_ch=3, input_time=None, input_ch_views=3, output_ch=4, skips=[4, 10], use_viewdirs=False):
 
     if input_time!=None:
         return init_nerf_model_dynamic(D=D, W=W, input_ch=input_ch, input_time=input_time,
@@ -224,7 +264,7 @@ def init_nerf_model_colorize(feature_vector=256, D=8, W=256, input_ch=3, input_t
     if use_viewdirs:
         alpha_out = dense(1, act=None)(outputs)
         alpha_out_2 = dense(1, act=None)(outputs2)
-        bottleneck = dense(256, act=None)(outputs)
+        bottleneck = dense(64, act=None)(outputs)
 
 
         inputs_viewdirs = tf.concat(

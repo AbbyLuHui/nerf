@@ -55,6 +55,20 @@ def batchify_nerf(fn, chunk):
         return output
     return ret
 
+def batchify_dynamic(fn, chunk):
+    if chunk is None:
+        return fn
+
+    def ret(inputs):
+        output = []
+        feature_map = []
+        for i in range(0, inputs.shape[0], chunk):
+            raw = fn(inputs[i:i + chunk])
+            output.append(raw[0])
+            feature_map.append(raw[1])
+        return tf.concat(output, 0), tf.concat(feature_map, 0)
+    return ret
+
 
 
 def run_network_colorize(inputs, viewdirs, fn, fn2, fn_feature, embed_fn, embeddirs_fn, netchunk=1024*64):
@@ -90,10 +104,10 @@ def run_network_colorize(inputs, viewdirs, fn, fn2, fn_feature, embed_fn, embedd
 
 def run_network_nerf(inputs, time_step, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
-
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
 
     embedded = embed_fn(inputs_flat)
+    features = features_flat = None
     if viewdirs is not None:
         input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
@@ -103,12 +117,14 @@ def run_network_nerf(inputs, time_step, viewdirs, fn, embed_fn, embeddirs_fn, ne
     if time_step is not None:
         time_step = tf.fill([embedded.shape[0], 5], float(time_step))
         embedded = tf.concat([embedded, time_step], -1)
-
-
-    outputs_flat = batchify_nerf(fn, netchunk)(embedded)
+        outputs_flat, features_flat = batchify_dynamic(fn, netchunk)(embedded)
+    else:
+        outputs_flat = batchify_nerf(fn, netchunk)(embedded)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
+    if features_flat != None:
+        features = tf.reshape(features_flat, list(inputs.shape[:-1]) + [features_flat.shape[-1]])
+    return outputs, features
 
 
 def render_rays(time_step,
@@ -119,6 +135,7 @@ def render_rays(time_step,
                 network_fn_2=None,
                 network_fn_feature=None,
                 retraw=False,
+                retfeature=False,
                 lindisp=False,
                 perturb=0.,
                 N_importance=0,
@@ -205,6 +222,7 @@ def render_rays(time_step,
         # Predict density of each sample along each ray. Higher values imply
         # higher likelihood of being absorbed at this point.
         alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+        print(tf.math.argmin(tf.math.argmax(alpha, 1)))
 
         # Compute weight for RGB of each sample along each ray.  A cumprod() is
         # used to express the idea of the ray not having reflected up to this
@@ -280,7 +298,9 @@ def render_rays(time_step,
 
     # Evaluate model at each point.
     if network_fn_2==None: # nerf or dynamic
-        raw = network_query_fn(pts, time_step, viewdirs, network_fn, network_fn_2, network_fn_feature)
+        raw, features = network_query_fn(pts, time_step, viewdirs, network_fn, network_fn_2, network_fn_feature)
+        if retfeature:
+            return features
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
@@ -355,11 +375,11 @@ def render_rays(time_step,
     return ret
 
 
-def batchify_rays(rays_flat, time_step, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, time_step, chunk=1024*32, retfeature=False, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(time_step, rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(time_step, rays_flat[i:i+chunk], retfeature=retfeature, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -438,7 +458,7 @@ def render(H, W, focal, time_step=None,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, time_step, chunk, **kwargs)
+    all_ret = batchify_rays(rays, time_step, chunk, retfeature=False, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
@@ -530,6 +550,7 @@ def create_nerf(args):
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(
             args.multires_views, args.i_embed)
+    print("input ch views: ", input_ch_views)
     output_ch = 4
     skips = [4, 10]
 
@@ -547,7 +568,7 @@ def create_nerf(args):
 
 
     if args.model_type=='colorization':
-        model, model2, model_feature = init_nerf_model_colorize(feature_vector=256,
+        model, model2, model_feature = init_nerf_model_colorize(feature_vector=64,
             D=args.netdepth, W=args.netwidth,
             input_ch=input_ch, output_ch=output_ch, skips=skips,
             input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
@@ -614,6 +635,26 @@ def create_nerf(args):
             'white_bkgd': args.white_bkgd,
             'raw_noise_std': args.raw_noise_std,
         }
+
+    elif args.model_type=='cycle':
+        model = init_nerf_model_cycle(D=args.netdepth, W=args.netwidth,
+                                input_ch=input_ch, input_time=5, output_ch=output_ch, skips=skips,
+                                input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+        models = {'model': model}
+        grad_vars = model.trainable_variables
+        model_fine = None
+        render_kwargs_train = {
+            'network_query_fn': network_query_fn_nerf,
+            'perturb': args.perturb,
+            'N_importance': args.N_importance,
+            'network_fine': model_fine,
+            'N_samples': args.N_samples,
+            'network_fn': model,
+            'use_viewdirs': args.use_viewdirs,
+            'white_bkgd': args.white_bkgd,
+            'raw_noise_std': args.raw_noise_std,
+        }
+
 
     elif args.model_type=='nerf':
         model = init_nerf_model(feature_vector=256,
@@ -713,7 +754,7 @@ def config_parser():
     parser.add_argument("--basedir", type=str, default='./logs',
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str,
-                        default='/local/vondrick/abby/CATER/CATER_new_000014', help='input data directory')
+                        default='/local/vondrick/abby/CATER/CATER_new_000000', help='input data directory')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8,
@@ -775,10 +816,10 @@ def config_parser():
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
     parser.add_argument("--evaluate", action='store_true',
                         help='evaluating instead of training feature transformation')
-    parser.add_argument("--render_camera", action='store_true',
+    parser.add_argument("--render_camera", action='store_false',
                         help='render from camera poses')
-    parser.add_argument("--model_type", type=str, default='colorization',
-                        help='options: colorization / dynamic / nerf')
+    parser.add_argument("--model_type", type=str, default='dynamic',
+                        help='options: colorization / dynamic / cycle / nerf')
 
 
     # dataset options
@@ -818,7 +859,7 @@ def config_parser():
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=50000,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=10000,
+    parser.add_argument("--i_video",   type=int, default=100000,
                         help='frequency of render_poses video saving')
 
     return parser
@@ -1007,7 +1048,7 @@ def train(datadir, expname):
         i_batch = 0
 
     #N_iters = 1000000
-    N_iters=10001
+    N_iters=2001
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -1090,6 +1131,25 @@ def train(datadir, expname):
                 loss_prior = img2mse(rgb, target_s_rgb)
                 trans = extras['raw'][..., -1]
                 psnr = mse2psnr(loss_prior)
+
+                # Add MSE loss for coarse-grained model
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    loss_prior += img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+
+            gradients = tape.gradient(loss_prior, grad_vars)
+            optimizer.apply_gradients(zip(gradients, grad_vars))
+            loss = loss_prior
+
+            if i % args.i_print == 0 or i < 10:
+                print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
+
+        elif args.model_type=='cycle':
+            with tf.GradientTape() as tape:
+                rgb, disp, acc, extras = render(
+                    H, W, focal, time_step=img_i / len(images), chunk=args.chunk, rays=batch_rays,
+                    verbose=i < 10, retraw=True, **render_kwargs_train)
 
                 # Add MSE loss for coarse-grained model
                 if 'rgb0' in extras:
@@ -1339,6 +1399,54 @@ def train(datadir, expname):
 
         global_step.assign_add(1)
 
+    # after training, perform cycle consistency
+    if args.model_type == 'dynamic':
+        time_span = 50
+        l = 5
+
+        lrate = 1e-4
+        #if args.lrate_decay > 0:
+        #    lrate = tf.keras.optimizers.schedules.ExponentialDecay(lrate,
+        #                                                           decay_steps=args.lrate_decay * 1000, decay_rate=0.1)
+        network_query_fn = render_kwargs_train['network_query_fn']
+        path = tf.Variable(tf.ones(shape=[time_span, 1, 1, 3], dtype=tf.float32) / 3, name='path')  #3D * t coordinates here
+        viewdirs = tf.Variable(tf.ones(shape=[time_span, 1, 3], dtype=tf.float32) / 100, name='viewdirs')
+        opt = tf.keras.optimizers.Adam(learning_rate=lrate)
+
+        for i in range(300):
+            with tf.GradientTape() as tape:
+                #tape.watch(path)
+                #loss = sum([tf.clip_by_value(tf.norm(network_query_fn(path[i], i/time_span, viewdirs[i], render_kwargs_train['network_fn'], None, None)[1] -
+                #                    network_query_fn(path[i + 1], (i + 1) / time_span, viewdirs[i + 1],
+                #                                     render_kwargs_train['network_fn'], None, None)[1], ord='euclidean'), 1e-8, 1e1) +
+                #       tf.clip_by_value(l * tf.norm(path[i] - path[i+1], ord='euclidean'), 1e-8, 1e1) for i in range(time_span-1)])
+                loss = 0
+                #time_t0 = tf.convert_to_tensor([t / time_span for t in range(time_span)])
+                #time_t1 = tf.convert_to_tensor([(t+1) / time_span for t in range(time_span)])
+                #rgb, feature_t0 = network_query_fn(path, time_t0, viewdirs, render_kwargs_train['network_fn'], None, None)
+                #rgb, feature_t1 = network_query_fn(path, time_t1, viewdirs, render_kwargs_train['network_fn'], None, None)
+                for t in range(time_span-1):
+                    # pts, time, viewdirs, network_fn, None, None
+                    rgb, feature_t0 = network_query_fn(path[t], t/time_span, viewdirs[t], render_kwargs_train['network_fn'], None, None)
+                    rgb, feature_t1 = network_query_fn(path[t+1], (t+1)/time_span, viewdirs[t+1], render_kwargs_train['network_fn'], None, None)
+                    loss += max(tf.norm(feature_t0-feature_t1, ord='euclidean'), 1e-8)
+                    loss += max(l * tf.norm(path[t]-path[t+1], ord='euclidean'), 1e-8)
+                    #loss += tf.clip_by_value(tf.norm(feature_t0-feature_t1, ord='euclidean'), 1e-8, 1e5)
+                    #loss += tf.clip_by_value(l * tf.norm(path[t]-path[t+1], ord='euclidean'), 1e-8, 1e5)
+            print('timestep: ', i, ' loss: ', loss.numpy())
+            grads = tape.gradient(loss, [path, viewdirs])
+            #processed_grads = [g for g in grads]
+            #grads_and_vars = zip(processed_grads, [path, viewdirs])
+            opt.apply_gradients(zip(grads, [path, viewdirs]))
+        print('Done finding the path')
+        print('path: ', path)
+        print('viewdir: ', viewdirs)
+        save_path_dir = os.path.join(datadir, 'path.npy')
+        save_view_dir = os.path.join(datadir, 'viewdir.npy')
+        np.save(save_path_dir, path.numpy())
+        np.save(save_view_dir, viewdirs.numpy())
+
+
 def train_ft():
     basedir = config_parser().parse_args().datadir
     count = 0
@@ -1353,8 +1461,8 @@ def train_ft():
 
 
 if __name__ == '__main__':
-    train_ft()
-    #basedir = config_parser().parse_args().datadir
-    #train(datadir=basedir, expname='CATER_new_000014')
+    #train_ft()
+    basedir = config_parser().parse_args().datadir
+    train(datadir=basedir, expname='CATER_new_000000')
     #basedir = config_parser().parse_args().datadir
     #train(datadir=os.path.join(basedir, '108d65300a99b40a'), expname='108d65300a99b40a')
